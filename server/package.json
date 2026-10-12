@@ -14,7 +14,8 @@
     "decomp:layerize-experiment": "tsx --conditions=development --env-file-if-exists=.env src/decomposition/layerizeExperiment.ts",
     "decomp:seedream-prompt": "tsx --conditions=development --env-file-if-exists=.env src/decomposition/seedreamPromptExperiment.ts",
     "decomp:smoke": "tsx --conditions=development --env-file-if-exists=.env src/decomposition/smoke.ts",
-    "decomp:backup": "tsx --conditions=development --env-file-if-exists=.env src/decomposition/setup.ts backup"
+    "decomp:backup": "tsx --conditions=development --env-file-if-exists=.env src/decomposition/setup.ts backup",
+    "studio:import-brand-kit": "tsx --conditions=development --env-file-if-exists=.env src/templateStudio/importBrandKit.ts"
   },
   "dependencies": {
     "@fal-ai/client": "^1.10.1",
@@ -28,7 +29,9 @@
     "express-rate-limit": "^8.7.0",
     "image-size": "^2.0.4",
     "openai": "^7.23.0",
-    "sharp": "^0.35.4"
+    "opentype.js": "^2.0.0",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/archiver": "^8.0.0",

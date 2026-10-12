@@ -7,8 +7,13 @@ const run: ExperimentRun = { id: '2026-10-07-example', createdAt: '2026-10-07T10
 describe('experiment workspace navigation', () => {
   it('exposes four named tabs with one keyboard stop and their panel relationships', () => {
     const html = renderToStaticMarkup(createElement(ExperimentTabs, { current: 'overview', runCount: 2, onChange: () => {} }));
-    for (const name of ['Overview', 'Create Template', 'Decompose/Test', 'Saved Runs']) expect(html).toContain(name);
+    for (const name of ['Overview', 'Template Studio', 'Decompose/Test', 'Saved Runs']) expect(html).toContain(name);
+    expect(html).not.toContain('Legacy Templates');
     expect(html.match(/role="tab"/g)).toHaveLength(4); expect(html.match(/tabindex="0"/g)).toHaveLength(1); expect(html).toContain('aria-controls="lab-panel-saved"');
+  });
+  it('shows the earlier template wizard as a fifth tab only with the legacy flag', () => {
+    const html = renderToStaticMarkup(createElement(ExperimentTabs, { current: 'create', runCount: 0, onChange: () => {}, legacy: true }));
+    expect(html.match(/role="tab"/g)).toHaveLength(5); expect(html).toContain('Legacy Templates'); expect(html).toContain('aria-controls="lab-panel-create"');
   });
   it('searches saved runs by ID, date or template and combines the status filter', () => {
     const runs = [run, { ...run, id: 'active', templateKey: 'template-c', stage: 'planning' }];

@@ -25,3 +25,8 @@ test-results/
 
 # Local phase 1–5 demo outputs (never commit uploads/generated media)
 /artifacts/decomposition/
+
+# Template Studio data (templates, assets, generated images, cost ledger); never commit
+/artifacts/template-studio/
+# Source archive of the Generator app, kept locally only
+/generator.zip

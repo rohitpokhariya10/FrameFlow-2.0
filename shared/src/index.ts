@@ -195,3 +195,4 @@ export * from './designTemplates/premiumLayouts.js';
 export * from './referenceCreative.js';
 export * from './aiPricing.js';
 export * from './creativeTemplates/index.js';
+export * from './templateStudio.js';

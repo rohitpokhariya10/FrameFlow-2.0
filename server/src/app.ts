@@ -27,7 +27,7 @@ export function readConfig(env = process.env): ServerConfig {
   }
   return { ...common, provider, apiKey: env.GEMINI_API_KEY?.trim(), model: env.GEMINI_IMAGE_MODEL?.trim() || 'gemini-3.1-flash-image' };
 }
-export function createApp(config: ServerConfig, provider?: GenerateImage, log: (event: object) => void = console.info, adaptationProvider?: AdaptImage, decompositionRouter?: Router, layerizeExperimentRouter?: Router, themePlanner?: ThemePlanner) {
+export function createApp(config: ServerConfig, provider?: GenerateImage, log: (event: object) => void = console.info, adaptationProvider?: AdaptImage, decompositionRouter?: Router, layerizeExperimentRouter?: Router, themePlanner?: ThemePlanner, templateStudioRouter?: Router) {
   const app = express();
   app.disable('x-powered-by'); app.set('trust proxy', config.trustProxyHops);
   const origins = new Set(['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3001', 'http://127.0.0.1:3001', ...(config.clientOrigin ? [config.clientOrigin.replace(/\/$/, '')] : [])]);
@@ -43,6 +43,8 @@ export function createApp(config: ServerConfig, provider?: GenerateImage, log: (
   if (decompositionRouter) app.use('/api/decomposition', decompositionRouter);
   // Local experiment: multipart upload with its own bounded parser, so it sits before the small JSON body limit.
   if (layerizeExperimentRouter) app.use('/api/layerize-experiment', layerizeExperimentRouter);
+  // Template Studio (template creation → image generation), beside the experiment it hands generated images to.
+  if (templateStudioRouter) app.use('/api/template-studio', templateStudioRouter);
   app.use('/api', cors({ origin: [...origins], methods: ['GET', 'POST', 'OPTIONS'], credentials: false, exposedHeaders: ['X-Request-Id', 'Retry-After'] }));
   const configured = Boolean(config.apiKey && (config.provider === 'gemini' || config.accountId));
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', aiConfigured: configured, aiAvailable: configured, provider: config.provider }));

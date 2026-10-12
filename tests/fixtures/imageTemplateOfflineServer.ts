@@ -21,6 +21,10 @@ import { TEMPLATE_CAPTURE_SCHEMA, SEMANTIC_SCHEMA, type SemanticAnalysis, type S
 import { BANGLE_PARTS, bangleAnalysis, blackSilhouetteEdit, creative, HOLDING_PARTS, holdingAnalysis, partPng } from '../../server/src/decomposition/protectedInteraction.fixture.js';
 import { curationFixture } from '../../server/src/decomposition/curation.fixture.js';
 import { parseStructure } from '../../server/src/decomposition/creativeTemplates/inspect.js';
+import { createTemplateStudioRouter } from '../../server/src/templateStudio/router.js';
+import { parseStudioEnv } from '../../server/src/templateStudio/config.js';
+import { FakeProvider, fakeSegmenter } from '../../server/src/templateStudio/testing/fakeProvider.js';
+import { logoPng, productCutoutPng, productPhotoPng, referencePosterPng, TEST_BRAND_RULES } from '../../server/src/templateStudio/testing/fixtures.js';
 
 if (process.env.FRAMEFLOW_OFFLINE_E2E !== '1') throw new Error('This fixture requires FRAMEFLOW_OFFLINE_E2E=1.');
 // No SDK transport is used. An accidental fetch fails before it can leave this process.
@@ -349,8 +353,20 @@ const router = createLayerizeRouter({
     return { image: black ? await blackSilhouetteEdit(image, mask) : await rowFillEdit(image, mask), requestId: `offline-edit-${providerCalls.length}` };
   } } }),
 });
+// Template Studio with MOCKED OpenAI answers and SAM-3 masks: synthetic scenes, never real generations.
+const studioProvider = new FakeProvider();
+studioProvider.delayMs = 300;
+const studioRouter = createTemplateStudioRouter({ env: parseStudioEnv({}, join(root, 'template-studio')), provider: studioProvider, segmenter: () => fakeSegmenter(), runsDir: join(root, 'runs'),
+  access: { production: true, clientOrigin: origin }, falConfigured: true, log: () => undefined });
 // Explicit empty configuration: no environment credentials or .env files are read.
-const app = createApp(readConfig({ CLIENT_ORIGIN: origin }), undefined, () => undefined, undefined, undefined, router);
+const app = createApp(readConfig({ CLIENT_ORIGIN: origin }), undefined, () => undefined, undefined, undefined, router, undefined, studioRouter);
+// Template Studio's fake provider calls (prompts and instructions), and synthetic posters and products to upload.
+app.get('/__test__/studio-calls', (_req, res) => res.json(studioProvider.calls.map(c => ({ kind: c.kind, schemaName: c.schemaName, system: c.system, prompt: c.prompt, images: c.images, fidelityMode: c.data?.fidelityMode }))));
+app.get('/__test__/studio-reference.png', async (_req, res) => res.type('png').send(await referencePosterPng()));
+app.get('/__test__/studio-product.png', async (req, res) => res.type('png').send(await productPhotoPng(String(req.query.colour ?? '#8b929c'))));
+app.get('/__test__/studio-cutout.png', async (_req, res) => res.type('png').send(await productCutoutPng()));
+app.get('/__test__/studio-logo.png', async (_req, res) => res.type('png').send(await logoPng('#14325c')));
+app.get('/__test__/studio-brand-rules', (_req, res) => res.json(TEST_BRAND_RULES));
 // Clone a persisted fake run into a billing-unknown failure; this route exists ONLY in the offline fixture.
 app.post('/__test__/dashboard-failure/:id', (req, res) => {
   if (!/^[0-9TZa-f-]+$/.test(req.params.id)) return void res.status(400).end();

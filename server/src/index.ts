@@ -3,12 +3,14 @@ import { createApp, readConfig } from './app.js';
 import { createDecompositionRouter } from './decomposition/router.js';
 import { readDecompositionConfig } from './decomposition/config.js';
 import { createLayerizeRouter, layerizeExperimentEnabled } from './decomposition/layerizeRouter.js';
+import { createTemplateStudioRouter } from './templateStudio/router.js';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
+const experiment = layerizeExperimentEnabled();
 const app = createApp(readConfig(), undefined, console.info, undefined, createDecompositionRouter(readDecompositionConfig()),
-  layerizeExperimentEnabled() ? createLayerizeRouter() : undefined);
+  experiment ? createLayerizeRouter() : undefined, undefined, experiment ? createTemplateStudioRouter() : undefined);
 
 const clientDist = fileURLToPath(new URL('../../client/dist/', import.meta.url));
 if (existsSync(clientDist)) {
