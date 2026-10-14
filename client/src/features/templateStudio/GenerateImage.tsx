@@ -2,11 +2,11 @@
  * Generate Image (Generator GenerateForm): template → products → exact campaign text → brand and logos → format →
  * occasion → generation mode, with the estimated cost before the click. Match Reference is the default.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChevronDown, Crosshair, Info, LayoutTemplate, Lock, Shuffle, Sparkles, Wand2 } from 'lucide-react';
 import {
   DEFAULT_FIDELITY_MODE, DEFAULT_STUDIO_FORMAT, FIDELITY_MODES, STUDIO_COPY_FIELDS, STUDIO_COPY_LIMITS, STUDIO_CREATIVE_DIRECTIONS, STUDIO_FORMATS, STUDIO_MAX_PRODUCTS,
-  STUDIO_OCCASION_GROUPS, type FidelityMode, type StudioAsset, type StudioBrandKit, type StudioCopyField, type StudioEstimate, type StudioImageQuality, type StudioTemplate,
+  STUDIO_OCCASION_GROUPS, type FidelityMode, type StudioAsset, type StudioBrandKit, type StudioCopyField, type StudioEstimate, type StudioImageQuality, type StudioTemplate, type StudioProductAction,
 } from '@frameflow/shared';
 import { newIdempotencyKey, studioApi } from './api';
 import { EstimateTable } from './CostViews';
@@ -30,6 +30,9 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
   const [formatId, setFormatId] = useState(DEFAULT_STUDIO_FORMAT), [quality, setQuality] = useState<StudioImageQuality>(defaultQuality);
   const [occasion, setOccasion] = useState(''), [customOccasion, setCustomOccasion] = useState('');
   const [mode, setMode] = useState<FidelityMode>(DEFAULT_FIDELITY_MODE), [directionId, setDirectionId] = useState(''), [direction, setDirection] = useState('');
+  const [productChoices, setProductChoices] = useState<Record<string, string>>({});
+  const [backgroundOnly, setBackgroundOnly] = useState(false);
+  const [referenceText, setReferenceText] = useState<'auto' | 'keep' | 'remove'>('auto');
   const [exact, setExact] = useState(false);
   const [estimate, setEstimate] = useState<StudioEstimate | null>(null), [estimateError, setEstimateError] = useState(''), [showBreakdown, setShowBreakdown] = useState(true);
   const [submitting, setSubmitting] = useState(false), [error, setError] = useState(''), [attempted, setAttempted] = useState(false);
@@ -52,16 +55,24 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
   const primaryLogos = kit?.logos.filter(l => l.kind === 'primary') ?? [];
   const format = STUDIO_FORMATS.find(f => f.id === formatId)!;
 
+  const referenceScene = template?.profile?.data.referenceScenes?.find(s => s.referenceId === 'ref1');
+  const productActions: StudioProductAction[] = (referenceScene?.products ?? []).map(p => {
+    const choice = productChoices[`${templateId}:${p.id}`] ?? 'keep';
+    return choice.startsWith('replace:') ? { productId: p.id, action: 'replace', replacementAssetId: choice.slice(8) } : { productId: p.id, action: choice as 'keep' | 'remove' };
+  });
+  const referenceChoices = { fidelityMode: mode, direction: direction.trim() || (mode === 'explore' && directionId ? STUDIO_CREATIVE_DIRECTIONS.find(d => d.id === directionId)?.text : null), occasion: (occasion === CUSTOM_OCCASION ? customOccasion : occasion).trim() || null, copy, productActions, backgroundOnly, ...(referenceText !== 'auto' ? { referenceText } : {}) };
+  const choicesKey = JSON.stringify(referenceChoices);
   const productKey = products.map(p => `${p.id}:${meta[p.id]?.name ?? ''}:${meta[p.id]?.subjectType ?? ''}:${meta[p.id]?.isSku ?? false}`).join('|');
   useEffect(() => {
+    let active = true;
     const timer = setTimeout(() => {
-      void studioApi.post<StudioEstimate>('/costs/estimate', { templateId: templateId || null, formatId, quality, products: products.map(p => ({ assetId: p.id, name: meta[p.id]?.name ?? '', subjectType: meta[p.id]?.subjectType || null, isSku: meta[p.id]?.isSku ?? false })) })
-        .then(e => { setEstimate(e); setEstimateError(''); }).catch((e: Error) => { setEstimate(null); setEstimateError(e.message); });
+      void studioApi.post<StudioEstimate>('/costs/estimate', { ...referenceChoices, templateId: templateId || null, formatId, quality, products: products.map(p => ({ assetId: p.id, name: meta[p.id]?.name ?? '', subjectType: meta[p.id]?.subjectType || null, isSku: meta[p.id]?.isSku ?? false })) })
+        .then(e => { if (active) { setEstimate(e); setEstimateError(''); } }).catch((e: Error) => { if (active) { setEstimate(null); setEstimateError(e.message); } });
     }, 200);
-    return () => clearTimeout(timer);
+    return () => { active = false; clearTimeout(timer); };
     // productKey stands for products and their metadata.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [productKey, formatId, quality, templateId]);
+  }, [productKey, formatId, quality, templateId, choicesKey]);
 
   const setProductList = (list: StudioAsset[]) => {
     setProducts(list);
@@ -71,13 +82,12 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
     setProducts(list => list.map(p => (p.id === from.id ? to : p)));
     setMeta(m => ({ ...m, [to.id]: m[from.id] ?? { name: to.label ?? 'Product', subjectType: '', isSku: false } }));
   };
-  const hasCopy = useMemo(() => Object.values(copy).some(v => (v ?? '').trim()), [copy]);
   const opaque = products.filter(p => !p.hasAlpha);
   const problems = [
     !template && 'Choose a template.',
-    !hasCopy && !products.length && 'Add at least a headline or a product.',
+    estimate?.blockedReason,
+    estimate?.daily && !estimate.daily.fits && `This operation exceeds the remaining Studio daily budget (${estimate.daily.remaining.usd}).`,
     products.some(p => !meta[p.id]?.name.trim()) && 'Give every product a name.',
-    exact && !products.length && 'Exact product pixels needs at least one product.',
     exact && opaque.length > 0 && `Exact product pixels needs transparent cutouts: ${opaque.map(p => meta[p.id]?.name || 'product').join(', ')} ${opaque.length === 1 ? 'is' : 'are'} not transparent.`,
     estimate && !estimate.withinCap && `This could exceed the ${estimate.cap.inr} limit per poster: use fewer products or a lower quality.`,
   ].filter((p): p is string => Boolean(p));
@@ -89,7 +99,7 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
     key.current ??= newIdempotencyKey();
     try {
       const res = await studioApi.post<{ jobId: string }>('/campaigns', {
-        idempotencyKey: key.current, templateId,
+        ...referenceChoices, idempotencyKey: key.current, templateId,
         subjects: products.map(p => ({ assetId: p.id, name: meta[p.id].name.trim(), subjectType: meta[p.id].subjectType.trim() || null, isSku: meta[p.id].isSku })),
         copy: Object.fromEntries(Object.entries(copy).filter(([, v]) => (v ?? '').trim())),
         partnerLogoIds: partners, formatId, quality, direction: direction.trim() || null,
@@ -119,7 +129,16 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
       </div>}
     </StepCard>
 
-    <StepCard step={2} title={`Products (optional, up to ${STUDIO_MAX_PRODUCTS})`} hint="Photos of the products to feature, hero first. Leave empty for a text-led poster.">
+    <StepCard step={2} title={`Products (optional, up to ${STUDIO_MAX_PRODUCTS})`} hint="Leave uploads empty to keep the original products. The first reference owns the product arrangement; additional references supply style only.">
+      {!referenceScene && <Alert tone="warn">This older template has no product inventory. Unchanged Match Reference reuse is available; analyse the template again to enable selective edits and new scenes.</Alert>}
+      <label className="ts-check"><input type="checkbox" checked={backgroundOnly} onChange={e => setBackgroundOnly(e.target.checked)} /> Background only — explicitly remove all reference products</label>
+      {!backgroundOnly && referenceScene?.products.map(p => <Field key={p.id} label={`${p.label} (${p.id})`} htmlFor={`ts-reference-${p.id}`} hint={p.identity}>
+        <select id={`ts-reference-${p.id}`} value={productChoices[`${templateId}:${p.id}`] ?? 'keep'} onChange={e => setProductChoices(c => ({ ...c, [`${templateId}:${p.id}`]: e.target.value }))}>
+          <option value="keep">Keep original product</option><option value="remove">Remove this product</option>
+          {products.map(a => <option key={a.id} value={`replace:${a.id}`}>Replace with {meta[a.id]?.name || a.label || 'uploaded product'}</option>)}
+        </select>
+      </Field>)}
+      <p className="ts-hint">Selective replacement uses transparent cutouts. Choose a replacement for each upload; all other slots stay unchanged. Protected products retain their original view and canvas proportions.</p>
       <ImagePicker roles={['subject', 'cutout']} uploadRole="subject" max={STUDIO_MAX_PRODUCTS} selected={products} onChange={setProductList} label="product photos" emptyText="No product photos yet. Upload some above." />
       {products.length > 0 && <ul className="ts-products">{products.map((p, i) => <li key={p.id}>
         <img src={p.urls.thumb} alt="" className={p.hasAlpha ? 'is-transparent' : undefined} />
@@ -132,6 +151,12 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
       </li>)}</ul>}
     </StepCard>
 
+    <Field label="Existing reference text and logos" htmlFor="ts-reference-text">
+      <select id="ts-reference-text" value={referenceText} onChange={e => setReferenceText(e.target.value as typeof referenceText)}>
+        <option value="auto">Automatic: keep on unchanged Match; remove for new copy or scenes</option>
+        <option value="keep">Keep original raster text and logos</option><option value="remove">Remove original raster text and logos</option>
+      </select>
+    </Field>
     <StepCard step={3} title="Campaign text (exactly as it should appear)" hint="Only filled fields are placed. Words are never rewritten, and no price, offer or date is ever invented; the image itself contains no text.">
       <div className="ts-form-grid">{STUDIO_COPY_FIELDS.map(f => <Field key={f.id} label={f.label} htmlFor={`ts-copy-${f.id}`} hint={copy[f.id] ? `${copy[f.id]!.length}/${STUDIO_COPY_LIMITS[f.id]}` : undefined}>
         {f.id === 'footer' || f.id === 'body'
@@ -191,7 +216,7 @@ export function GenerateImage({ initialTemplateId, cutoutOffer, defaultQuality, 
           <button type="button" className="ws-link" aria-expanded={showBreakdown} onClick={() => setShowBreakdown(s => !s)}>{showBreakdown ? 'Hide' : 'Show'} breakdown</button></>
           : <small>{estimateError || 'Estimating…'}</small>}
       </div>
-      <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={submitting || !templates} onClick={() => void submit()}><Sparkles size={16} aria-hidden="true" />{submitting ? 'Starting…' : 'Generate image'}</button>
+      <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={submitting || !estimate || Boolean(estimateError) || !templates || Boolean(estimate?.daily && !estimate.daily.fits) || Boolean(estimate?.blockedReason) || Boolean(estimate && !estimate.withinCap)} onClick={() => void submit()}><Sparkles size={16} aria-hidden="true" />{submitting ? 'Starting…' : 'Generate image'}</button>
     </div>
     {attempted && problems.length > 0 && <Alert tone="warn"><ul className="ts-problems">{problems.map(p => <li key={p}>{p}</li>)}</ul></Alert>}
     {estimate && showBreakdown && <StepCard title="Cost breakdown before generating" hint={<><Info size={13} aria-hidden="true" /> Each line is an upper bound for one paid call. Cached stages make no new call.</>}><EstimateTable estimate={estimate} /></StepCard>}

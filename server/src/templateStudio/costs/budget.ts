@@ -43,7 +43,23 @@ function charged(r: Pick<BudgetReservationRecord, "status" | "microUsd" | "actua
 
 export function spentToday(db: StudioStore, at = new Date()) {
   const since = startOfToday(at).toISOString();
-  return db.reservations.filter((r) => r.createdAt >= since && r.status !== "released").reduce((s, r) => s + charged(r), 0);
+  return db.reservations.filter((r) => (r.createdAt >= since || r.status === 'held') && r.status !== "released").reduce((s, r) => s + charged(r), 0);
+}
+
+export function budgetStatus(db: StudioStore, env: ServerEnv) {
+  const cap = toMicro(env.DAILY_BUDGET_USD), used = spentToday(db);
+  const held = db.reservations.filter(r => r.status === 'held').reduce((s, r) => s + r.microUsd, 0);
+  const reset = startOfToday(); reset.setDate(reset.getDate() + 1);
+  return { cap, used, held, remaining: Math.max(0, cap - used), resets: reset.toISOString() };
+}
+
+/** Whole-operation check before any paid preparation. Per-call reservations remain authoritative. */
+export function preflightBudget(db: StudioStore, env: ServerEnv, estimateMicroUsd: number, kind = 'generate_poster') {
+  if (!Number.isSafeInteger(estimateMicroUsd) || estimateMicroUsd < 0) throw new BudgetExceededError('Invalid operation estimate.');
+  if (estimateMicroUsd === 0) return;
+  const cap = jobCapMicroUsd(kind, env), daily = budgetStatus(db, env);
+  if (estimateMicroUsd > cap) throw new BudgetExceededError(`Operation estimate ${formatUsd(estimateMicroUsd)} exceeds the per-job limit ${formatUsd(cap)}. No paid preparation started.`);
+  if (estimateMicroUsd > daily.remaining) throw new BudgetExceededError(`Operation estimate ${formatUsd(estimateMicroUsd)} exceeds the remaining Studio daily budget ${formatUsd(daily.remaining)} (cap ${formatUsd(daily.cap)}, used/reserved ${formatUsd(daily.used)}). No paid preparation started.`);
 }
 
 export function reserveBudget(
@@ -51,6 +67,7 @@ export function reserveBudget(
   env: ServerEnv,
   args: { jobId: string; jobKind: string; stage: string; estimateMicroUsd: number; now?: Date },
 ) {
+  if (!Number.isSafeInteger(args.estimateMicroUsd) || args.estimateMicroUsd < 0) throw new BudgetExceededError('Invalid call estimate.');
   const jobCap = jobCapMicroUsd(args.jobKind, env);
   const dailyCap = toMicro(env.DAILY_BUDGET_USD);
   const money = (m: number) => `${formatUsd(m)} (≈ ${formatInr(m, env.USD_INR_RATE)})`;
@@ -92,6 +109,11 @@ export function settleUsage(
     estimateMicroUsd: number;
   },
 ) {
+  const previous = db.usage.find(r => r.jobId === args.jobId && r.stage === args.stage);
+  if (previous) {
+    db.reservations.updateMany(r => r.jobId === args.jobId && r.stage === args.stage && r.status === 'held', () => ({ status: 'settled', actualMicroUsd: previous.usageDerivedMicroUsd, updatedAt: now() }));
+    return previous.usageDerivedMicroUsd;
+  }
   const derived = costFromUsage(args.model, args.usage);
   db.usage.insert({
     id: newId("use"),

@@ -5,11 +5,13 @@ import { parseRules } from "../brand/kits.js";
 import { getFormat } from "../compose/formats.js";
 import { copySchema } from "../compose/overlay.js";
 import { presentFields } from "../compose/build.js";
-import { estimatePoster } from "../costs/profiles.js";
+import { estimateReferencePoster } from "../costs/profiles.js";
 import { CostUnboundedError, formatInr, formatUsd } from "../costs/estimate.js";
 import { enqueueJob } from "../jobs/queue.js";
 import type { GeneratePosterInput } from "../jobs/kinds/generatePoster.js";
 import { newId, now, type StudioStore as Db } from "../store.js";
+import { resolveReferencePolicy } from '../referencePolicy.js';
+import { preflightBudget } from '../costs/budget.js';
 
 export class CampaignError extends Error {
   constructor(
@@ -22,6 +24,9 @@ export class CampaignError extends Error {
 }
 
 export const createCampaignSchema = z.object({
+  productActions: z.array(z.object({ productId: z.string(), action: z.enum(['keep', 'replace', 'remove']), replacementAssetId: z.string().optional() })).max(20).optional(),
+  backgroundOnly: z.boolean().optional(),
+  referenceText: z.enum(['keep', 'remove']).optional(),
   idempotencyKey: z.string().min(8).max(128),
   templateId: z.string().min(1),
   /** Defaults to the template's brand kit; null for no brand kit. */
@@ -73,7 +78,9 @@ export function createCampaign(db: Db, env: ServerEnv, given: CreateCampaignInpu
   const format = getFormat(input.formatId);
   if (!format) throw new CampaignError("invalid", "Unknown output format.");
   const fields = presentFields(input.copy);
-  if (fields.length === 0 && input.subjects.length === 0) throw new CampaignError("invalid", "Add at least a headline or a product.");
+  let referencePolicy;
+  try { referencePolicy = resolveReferencePolicy(db, input); }
+  catch (err) { throw new CampaignError('invalid', (err as Error).message); }
   if (new Set(input.subjects.map((s) => s.assetId)).size !== input.subjects.length) throw new CampaignError("invalid", "Each product image can be used once.");
   if (input.creativeDirectionId && input.fidelityMode !== "explore") throw new CampaignError("invalid", "A creative direction applies to Explore Creatives only.");
   if (input.creativeDirectionId && !studioCreativeDirection(input.creativeDirectionId)) throw new CampaignError("invalid", "Unknown creative direction.");
@@ -97,15 +104,20 @@ export function createCampaign(db: Db, env: ServerEnv, given: CreateCampaignInpu
     throw new CampaignError("invalid", "Products must be uploaded as 'Product / subject' images.");
   }
   if (input.preserveProductPixels) {
-    if (!input.subjects.length) throw new CampaignError("invalid", "Exact product pixels needs at least one product.");
     const opaque = input.subjects.filter((_, i) => !assets[i]!.hasAlpha).map((s) => s.name);
     if (opaque.length) throw new CampaignError("invalid", `Exact product pixels needs a transparent cutout (PNG with a transparent background) for every product. Not transparent: ${opaque.join(", ")}.`);
   }
 
   const quality = input.quality ?? env.IMAGE_QUALITY;
+  if (referencePolicy.actions.some(a => a.action === 'replace')) {
+    const opaque = assets.filter(a => !a!.hasAlpha);
+    if (opaque.length) throw new CampaignError('invalid', 'Selective replacement needs a transparent cutout. Use Make cutout or upload a transparent PNG.');
+  }
   try {
-    const estimate = estimatePoster(env, { subjects: input.subjects.length, size: format.providerSize, quality });
-    if (!estimate.withinCap) {
+    const estimate = estimateReferencePoster(env, referencePolicy, { subjects: input.subjects.length, size: format.providerSize, quality });
+    const total = estimate.totalMicroUsd;
+    preflightBudget(db, env, total);
+    if (!referencePolicy.localReuse && !estimate.withinCap) {
       throw new CampaignError(
         "over_budget",
         `This poster could cost up to ${formatUsd(estimate.totalMicroUsd)} (≈ ${formatInr(estimate.totalMicroUsd, env.USD_INR_RATE)}), above the ${formatUsd(estimate.capMicroUsd)} limit. Use fewer products, a lower quality, or raise STUDIO_MAX_JOB_BUDGET_USD.`,
@@ -129,6 +141,7 @@ export function createCampaign(db: Db, env: ServerEnv, given: CreateCampaignInpu
   const copy = Object.fromEntries(fields.map((f) => [f, input.copy[f]!.trim()]));
   const direction = directionText(input);
   const campaign = db.campaigns.insert({
+    referencePolicy,
     id: newId("cmp"),
     templateId: template.id,
     profileVersionId: template.currentProfileVersionId,
@@ -150,6 +163,7 @@ export function createCampaign(db: Db, env: ServerEnv, given: CreateCampaignInpu
   });
 
   const jobInput: GeneratePosterInput = {
+    referencePolicy,
     campaignId: campaign.id,
     templateId: template.id,
     profileVersionId: template.currentProfileVersionId,

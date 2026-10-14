@@ -13,6 +13,12 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { StudioProductAction, StudioReferenceScene } from '@frameflow/shared';
+
+export interface ReferencePolicy {
+  primaryAssetId: string; scene: StudioReferenceScene | null;
+  actions: StudioProductAction[]; backgroundOnly: boolean; text: 'keep' | 'remove'; localReuse: boolean;
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_STUDIO_DIR = resolve(here, '../../../artifacts/template-studio');
@@ -53,6 +59,7 @@ export interface SubjectRecord {
   analysis: unknown | null; analysisModel: string | null; analysisCacheKey: string | null; analysisConfidence: number | null; createdAt: string; updatedAt: string;
 }
 export interface CampaignRecord {
+  referencePolicy?: ReferencePolicy;
   id: string; templateId: string; profileVersionId: string; copy: Record<string, string>; partnerLogoIds: string[]; subjectIds: string[];
   formatId: string; imageQuality: 'low' | 'medium' | 'high'; outputWidth: number; outputHeight: number; direction: string | null; occasion: string | null;
   creativeDirectionId: string | null; fidelityMode: 'match' | 'adapt' | 'explore'; preserveProductPixels: boolean;
@@ -79,6 +86,10 @@ export interface GenerationAttemptRecord {
   error: { code: string; message: string } | null; createdAt: string;
 }
 export interface PosterRecord {
+  provenance?: 'reference_reuse' | 'ai_generated';
+  decompositionAssetId?: string;
+  productLayers?: { productId: string; assetId: string; box: { x: number; y: number; width: number; height: number } }[];
+  expectedProductCount?: number;
   id: string; campaignId: string; jobId: string | null;
   /** The text-free scene the poster is built on (with exact product pixels composited, when that was asked and worked). */
   sceneAssetId: string;
@@ -93,6 +104,7 @@ export interface ReviewRecord {
   hardFailures: { code: string; description: string }[]; scores: unknown | null; issues: unknown; referenceMatch: unknown | null; createdAt: string;
 }
 export interface UsageLedgerRecord {
+  response?: { text: string | null; refusal: string | null; incompleteReason: string | null };
   id: string; jobId: string | null; stage: string; model: string; providerRequestId: string | null; rawUsage: unknown | null;
   rateCardVersion: string; estimatedMicroUsd: number | null; usageDerivedMicroUsd: number | null; costUnknown: boolean; createdAt: string;
 }

@@ -52,7 +52,7 @@ export function reviewChecks(input: {
   }
 
   if (input.exactProducts?.applied) {
-    checks.push({ id: "identity", label: "Product identity", status: input.exactProducts.ok ? "pass" : "warn", detail: input.exactProducts.detail });
+    checks.push({ id: "identity", label: "Product identity", status: hard.some(h => h.code === "product_identity" || h.code === "subject_count") ? "fail" : input.exactProducts.ok ? "pass" : "warn", detail: input.exactProducts.detail });
   } else if (!input.products) checks.push({ id: "identity", label: "Product identity", status: "unchecked", detail: "No products in this poster." });
   else if (!reviewed) checks.push(notReviewed("Product identity", "identity"));
   else checks.push({ id: "identity", label: "Product identity", status: byScore(scores?.subjectIdentity), detail: `Identity ${scores?.subjectIdentity}/5. The image model redraws products: compare them with your photos by eye. ${issueText(["product_identity"])}`.trim() });
@@ -101,6 +101,11 @@ export function reviewChecks(input: {
     status: sceneText.length ? "fail" : reviewed ? "pass" : "unchecked",
     detail: sceneText.map((h) => h.description).join(" ") || (reviewed ? "No text, numbers or logos found in the generated image." : "Not reviewed."),
   });
+  if (input.exactProducts?.detail.startsWith('The entire primary reference')) {
+    for (const check of checks) if (['reference', 'background', 'missing'].includes(check.id)) Object.assign(check, { status: 'pass', detail: 'Deterministic local reuse of the complete primary reference. No generated replacement scene and no AI review.' });
+    const text = checks.find(c => c.id === 'scene_text')!;
+    Object.assign(text, { status: 'unchecked', detail: 'Original raster text and logos intentionally retained. New native copy needs visual review.' });
+  }
   return checks;
 }
 
@@ -123,6 +128,7 @@ export function posterDetail(db: Db, env: ServerEnv, posterId: string): StudioPo
   const report = poster.layoutReport as LayoutReport | null;
   const mode = campaign.fidelityMode;
   return {
+    provenance: poster.provenance ?? 'ai_generated', productActions: campaign.referencePolicy?.actions,
     id: poster.id,
     campaignId: poster.campaignId,
     jobId: poster.jobId,
@@ -166,7 +172,7 @@ export function posterDetail(db: Db, env: ServerEnv, posterId: string): StudioPo
           createdAt: review.createdAt,
         }
       : null,
-    checks: reviewChecks({ fidelityMode: mode, review, report, hasBrandKit: Boolean(doc.brandKitId), products: subjects.length, exactProducts: poster.exactProducts }),
+    checks: reviewChecks({ fidelityMode: mode, review, report, hasBrandKit: Boolean(doc.brandKitId), products: poster.expectedProductCount ?? subjects.length, exactProducts: poster.exactProducts }),
     exactProducts: poster.exactProducts,
     plan: plan
       ? {
@@ -235,6 +241,7 @@ export function editorOverlay(poster: PosterRecord, logoBox: { x: number; y: num
   const report = poster.layoutReport as LayoutReport | null;
   return {
     posterId: poster.id,
+    products: poster.productLayers?.map(p => ({ id: p.productId, url: assetUrl(p.assetId), box: { x: p.box.x / doc.crop.width, y: p.box.y / doc.crop.height, width: p.box.width / doc.crop.width, height: p.box.height / doc.crop.height } })),
     canvas: doc.canvas,
     texts: doc.texts
       .filter((t) => !t.hidden && t.text.trim())

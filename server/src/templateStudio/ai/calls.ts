@@ -75,9 +75,11 @@ export async function structuredCall<T>(ctx: CallContext, opts: StructuredCallOp
   }
   await reserve(ctx, opts.key, estimate.microUsd);
 
+  const cached = ctx.db.usage.find(u => u.jobId === ctx.job.id && u.stage === opts.key);
   let res;
   try {
-    res = await ctx.provider.structured(request);
+    if (cached && !cached.response) throw new JobStageError('outcome_unknown', 'This paid response was not saved. It will not be sent again.', { outcomeUnknown: true });
+    res = cached ? { ...cached.response!, usage: cached.rawUsage, requestId: cached.providerRequestId } : await ctx.provider.structured(request);
   } catch (err) {
     return failProvider(ctx, opts.key, err);
   }
@@ -89,6 +91,9 @@ export async function structuredCall<T>(ctx: CallContext, opts: StructuredCallOp
     providerRequestId: res.requestId,
     estimateMicroUsd: estimate.microUsd,
   });
+
+  const recorded = ctx.db.usage.find(u => u.jobId === ctx.job.id && u.stage === opts.key)!;
+  ctx.db.usage.update(recorded.id, { response: { text: res.text, refusal: res.refusal, incompleteReason: res.incompleteReason } });
 
   if (res.refusal) {
     throw new JobStageError("refusal", "The model declined this request. Check the images and text for anything it may not process.", {
@@ -136,8 +141,10 @@ export async function structuredCall<T>(ctx: CallContext, opts: StructuredCallOp
   }
   await reserve(ctx, repairKey, repairEstimate.microUsd);
   let repaired;
+  const cachedRepair = ctx.db.usage.find(u => u.jobId === ctx.job.id && u.stage === repairKey);
   try {
-    repaired = await ctx.provider.structured(repairRequest);
+    if (cachedRepair && !cachedRepair.response) throw new JobStageError('outcome_unknown', 'The paid repair response was not saved and will not be repeated.', { outcomeUnknown: true });
+    repaired = cachedRepair ? { ...cachedRepair.response!, usage: cachedRepair.rawUsage, requestId: cachedRepair.providerRequestId } : await ctx.provider.structured(repairRequest);
   } catch (err) {
     return failProvider(ctx, repairKey, err);
   }
@@ -149,6 +156,8 @@ export async function structuredCall<T>(ctx: CallContext, opts: StructuredCallOp
     providerRequestId: repaired.requestId,
     estimateMicroUsd: repairEstimate.microUsd,
   });
+  const repairRecord = ctx.db.usage.find(u => u.jobId === ctx.job.id && u.stage === repairKey)!;
+  ctx.db.usage.update(repairRecord.id, { response: { text: repaired.text, refusal: repaired.refusal, incompleteReason: repaired.incompleteReason } });
   const second = validate(repaired.text, request.schema, opts.check);
   if (second.ok) return { data: second.data, repaired: true };
   throw new JobStageError("invalid_output", "The model's answer didn't match the required structure, even after one correction attempt.", {
@@ -174,6 +183,7 @@ function validate<T>(text: string | null, schema: z.ZodType<T>, check?: (d: T) =
 }
 
 export async function imageCall(ctx: CallContext, key: string, request: ImageEditRequest) {
+  if (ctx.db.usage.find(u => u.jobId === ctx.job.id && u.stage === key)) throw new JobStageError('outcome_unknown', 'An image call with this key was already billed. It will not be repeated.', { outcomeUnknown: true });
   let estimate;
   try {
     estimate = estimateImageCall({

@@ -27,13 +27,17 @@ export class HandoffError extends Error {
 /** The PNG sent to decomposition for this poster, and how it was prepared from the generated image. */
 export async function decompositionScene(db: StudioStore, storageDir: string, poster: PosterRecord) {
   const doc = overlayDocSchema.parse(poster.overlay);
-  const scene = db.assets.require(doc.sceneAssetId, 'Scene');
+  const scene = db.assets.require(poster.decompositionAssetId ?? doc.sceneAssetId, 'Scene');
   const full = doc.crop.x === 0 && doc.crop.y === 0 && doc.crop.width === scene.width && doc.crop.height === scene.height;
   const bytes = full
     ? await readStorageFile(storageDir, scene.normalisedPath)
     : await sharp(await readStorageFile(storageDir, scene.normalisedPath)).extract({ left: doc.crop.x, top: doc.crop.y, width: doc.crop.width, height: doc.crop.height }).png().toBuffer();
   const { asset } = await ingestAsset({ buffer: bytes, role: 'export', filename: `decompose-${poster.id}.png`, label: `Decomposition input for poster ${poster.id}` }, { db, storageDir });
-  const note = full
+  const note = poster.decompositionAssetId
+    ? `Background only (${asset.width}×${asset.height}): protected source-product layers are restored directly in the editor, without re-extracting their pixels.`
+    : poster.provenance === 'reference_reuse'
+      ? `Reused original reference (${asset.width}×${asset.height}), including original raster text and logos.`
+      : full
     ? `The generated scene as is (${asset.width}×${asset.height}), without text or logo.`
     : `The generated scene cropped to the poster's ${doc.canvas.width}:${doc.canvas.height} area (${asset.width}×${asset.height} of ${scene.width}×${scene.height}), without text or logo.`;
   return { asset, bytes: await readStorageFile(storageDir, asset.originalPath), note, canvas: doc.canvas, crop: doc.crop };

@@ -18,7 +18,20 @@ const confidence = z.number().min(0).max(1);
 // Style profile (template analysis)
 // ---------------------------------------------------------------------------
 
-export const STYLE_PROFILE_SCHEMA = "style-profile/4";
+export const STYLE_PROFILE_SCHEMA = "style-profile/5";
+
+const referenceBox = z.object({ x: unit, y: unit, width: unit, height: unit });
+export const referenceSceneSchema = z.object({
+  referenceId: z.string(), confidence,
+  products: z.array(z.object({
+    id: z.string().describe('Stable local ID, p1, p2 etc. Ordered left to right. One per complete product instance, not per component.'),
+    label: z.string(), identity: z.string(), box: referenceBox,
+    depth: z.number(), confidence, overlaps: z.array(z.string()), transparent: z.boolean(),
+    shadows: z.string(), reflections: z.string(),
+  })).max(20),
+  camera: z.string(), lighting: z.string(), supportingObjects: z.array(z.string()), background: z.string(),
+  textRegions: z.array(z.object({ kind: z.enum(['text', 'logo']), description: z.string(), box: referenceBox })),
+});
 
 export const VISUAL_MEDIA = ["photo", "illustration", "3d-render", "collage", "typography-led", "mixed", "unknown"] as const;
 
@@ -59,6 +72,7 @@ export type Composition = z.infer<typeof compositionSchema>;
 export function styleProfileSchema(referenceIds: readonly [string, ...string[]], fontFamilies: readonly [string, ...string[]]) {
   const refId = z.enum(referenceIds);
   return z.object({
+    referenceScenes: z.array(referenceSceneSchema).describe('Inventory separately for EVERY reference. ref1 is the primary composition and product source. Additional references are style only.'),
     summary: z.string().describe("2–3 sentence human-readable description of the reusable style"),
     visualMedium: z.enum(VISUAL_MEDIA),
     campaignCharacter: z.string(),
@@ -114,7 +128,7 @@ export function styleProfileSchema(referenceIds: readonly [string, ...string[]],
     singleReferenceCaveat: z.string().nullable(),
   });
 }
-export type StyleProfile = z.infer<ReturnType<typeof styleProfileSchema>>;
+export type StyleProfile = Omit<z.infer<ReturnType<typeof styleProfileSchema>>, 'referenceScenes'> & { referenceScenes?: z.infer<typeof referenceSceneSchema>[] };
 
 // ---------------------------------------------------------------------------
 // Subject analysis
@@ -270,7 +284,11 @@ export function reviewSchema(styleRules: readonly string[], opts: { matchReferen
         }),
       )
       .max(12),
-    copiedReferenceContent: z.array(z.string()).max(6).describe("Text, logos or products copied from the template reference"),
+    productIntegrity: z.object({
+      observedCount: z.number().int().min(0).nullable(),
+      missing: z.array(z.string()), unexpected: z.array(z.string()), identityProblems: z.array(z.string()), uncertainties: z.array(z.string()),
+    }).describe('Count actual output products, identify missing expected IDs and unintended additions. Report uncertainty honestly; high style scores never excuse missing products.'),
+    copiedReferenceContent: z.array(z.string()).max(6).describe("Unrequested text, logos or products copied from additional references. Primary KEEP products and deliberately retained raster text are expected, not violations."),
     unwantedSceneText: z
       .array(z.string())
       .max(10)

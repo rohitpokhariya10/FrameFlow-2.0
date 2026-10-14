@@ -46,7 +46,7 @@ const EXPECTED: Record<string, string[]> = {
 };
 
 /** Polls a job until it ends; onDone runs once at the end (also when the job had already ended). */
-export function useJob(jobId: string | null | undefined, onDone?: (job: StudioJob) => void) {
+export function useJob(jobId: string | null | undefined, onDone?: (job: StudioJob) => void, refresh = 0) {
   const [job, setJob] = useState<StudioJob | null>(null), [error, setError] = useState('');
   const done = useRef(onDone);
   useEffect(() => { done.current = onDone; }, [onDone]);
@@ -64,7 +64,7 @@ export function useJob(jobId: string | null | undefined, onDone?: (job: StudioJo
     };
     void tick();
     return () => { alive = false; if (timer) clearTimeout(timer); };
-  }, [jobId]);
+  }, [jobId, refresh]);
   return { job: job?.id === jobId ? job : null, error };
 }
 

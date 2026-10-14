@@ -54,6 +54,18 @@ export const FIDELITY_MODES = [
   { id: 'explore', label: 'Explore Creatives', summary: 'Uses the template as loose inspiration for new environments and staging. Pick a FrameFlow creative direction or let the AI decide.' },
 ] as const;
 export type FidelityMode = typeof FIDELITY_MODES[number]['id'];
+export interface StudioReferenceProduct {
+  id: string; label: string; identity: string;
+  box: { x: number; y: number; width: number; height: number };
+  depth: number; confidence: number; overlaps: string[]; transparent: boolean;
+  shadows: string; reflections: string;
+}
+export interface StudioReferenceScene {
+  referenceId: string; products: StudioReferenceProduct[]; confidence: number;
+  camera: string; lighting: string; supportingObjects: string[]; background: string;
+  textRegions: { kind: 'text' | 'logo'; description: string; box: { x: number; y: number; width: number; height: number } }[];
+}
+export interface StudioProductAction { productId: string; action: 'keep' | 'replace' | 'remove'; replacementAssetId?: string }
 export const DEFAULT_FIDELITY_MODE: FidelityMode = 'match';
 
 /** Explore mode can start from one of FrameFlow's twelve creative directions (creativeTemplates/creativeDirections.ts). */
@@ -84,6 +96,8 @@ export interface StudioAsset {
 }
 
 export interface StudioStyleProfile {
+  /** Absent in old profiles: reuse is safe, editing requires fresh analysis. First reference owns the products. */
+  referenceScenes?: StudioReferenceScene[];
   summary: string; visualMedium: string; campaignCharacter: string; visualHierarchy: string;
   palette: { colors: { hex: string; role: string; prominence: 'dominant' | 'secondary' | 'accent' }[]; allowedVariation: string };
   typography: { headlineCharacter: string; bodyCharacter: string; casing: string; suggestedHeadlineFamily: string; suggestedBodyFamily: string; identificationConfidence: number };
@@ -128,13 +142,17 @@ export interface StudioCostLine {
   estimated: StudioMoney | null; recorded: StudioMoney | null; at: string;
 }
 export interface StudioCostSummary {
+  reserved?: StudioMoney;
   /** Sum of usage-derived costs plus reserved estimates where usage is unknown (never ₹0 for an unknown call). */
   total: StudioMoney; usageDerived: StudioMoney; estimatedOnly: StudioMoney;
   calls: number; unknownCalls: number; lines: StudioCostLine[]; fx: StudioFx; rateCardVersion: string;
 }
 
 export interface StudioEstimateLine { stage: string; model: string; cost: StudioMoney; cached: boolean; note?: string; assumptions: string[] }
-export interface StudioEstimate { label: string; lines: StudioEstimateLine[]; total: StudioMoney; cap: StudioMoney; withinCap: boolean; quality: StudioImageQuality; providerSize: string; fx: StudioFx; rateCardVersion: string; note: string }
+export interface StudioEstimate { label: string; lines: StudioEstimateLine[]; total: StudioMoney; cap: StudioMoney; withinCap: boolean; quality: StudioImageQuality; providerSize: string; fx: StudioFx; rateCardVersion: string; note: string;
+  daily?: { cap: StudioMoney; used: StudioMoney; held: StudioMoney; remaining: StudioMoney; fits: boolean; resets: string };
+  localReuse?: boolean; segmentation?: StudioMoney; blockedReason?: string | null;
+}
 
 export interface StudioOverlayText {
   id: string; kind: 'text'; field: StudioCopyField; text: string; box: { x: number; y: number; width: number; height: number };
@@ -149,6 +167,8 @@ export interface StudioLayoutReport {
 
 export interface StudioReviewCheck { id: string; label: string; status: 'pass' | 'warn' | 'fail' | 'unchecked'; detail: string }
 export interface StudioPoster {
+  provenance?: 'reference_reuse' | 'ai_generated';
+  productActions?: StudioProductAction[];
   id: string; campaignId: string; jobId: string | null; createdAt: string; updatedAt: string;
   reviewStatus: 'pending' | 'ok' | 'needs_review'; approvedAt: string | null;
   template: { id: string; name: string; references: { assetId: string; thumb: string; full: string }[]; profileVersion: number | null };
@@ -204,6 +224,7 @@ export interface StudioDecompositionLink { id: string; posterId: string; runId: 
 
 /** What the editor needs to restore the campaign copy and logos as native elements over the decomposed layers. */
 export interface StudioEditorOverlay {
+  products?: { id: string; url: string; box: { x: number; y: number; width: number; height: number } }[];
   posterId: string; canvas: { width: number; height: number };
   texts: (StudioOverlayText & { renderedFontSizePct: number | null; lines: string[] })[];
   logo: { url: string; box: { x: number; y: number; width: number; height: number } } | null;

@@ -48,6 +48,8 @@ export class EnvConfigError extends Error {
 }
 
 export function parseStudioEnv(source: Record<string, string | undefined> = process.env, dataDir?: string): ServerEnv {
+  const emptyBudgets = ['STUDIO_MAX_JOB_BUDGET_USD', 'STUDIO_MAX_TEMPLATE_BUDGET_USD', 'STUDIO_DAILY_BUDGET_USD'].filter(k => source[k] !== undefined && !source[k]!.trim());
+  if (emptyBudgets.length) throw new EnvConfigError(emptyBudgets.map(k => `${k}: enter a non-negative USD amount, or remove the variable to use its default.`));
   const cleaned = Object.fromEntries(Object.entries(source).map(([k, v]) => [k, v === '' ? undefined : v]));
   const result = schema.safeParse(cleaned);
   if (!result.success) throw new EnvConfigError(result.error.issues.map(i => `${i.path.join('.') || '(root)'}: ${i.message}`));

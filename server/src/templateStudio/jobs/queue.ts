@@ -104,8 +104,7 @@ export function finishJob(
     ...(extra.error ? { error: extra.error } : {}),
     ...(extra.result !== undefined ? { result: extra.result } : {}),
   });
-  // Return any unspent budget holds.
-  db.reservations.updateMany((r) => r.jobId === jobId && r.status === "held", () => ({ status: "released", updatedAt: now() }));
+  // Holds are created immediately before provider calls. An unsettled hold may have been billed; only a known pre-processing rejection may release it.
   return true;
 }
 
@@ -121,8 +120,16 @@ export function requestCancel(db: StudioStore, jobId: string, at = new Date()) {
   const leased = job.leaseExpiresAt !== null && job.leaseExpiresAt > at.toISOString();
   if (!leased) {
     db.jobs.update(jobId, { state: "cancelled", cancelRequested: true, finishedAt: at.toISOString(), leaseOwner: null, leaseExpiresAt: null, updatedAt: now() });
-    db.reservations.updateMany((r) => r.jobId === jobId && r.status === "held", () => ({ status: "released", updatedAt: now() }));
+    // Preserve interrupted-call holds, including jobs whose lease expired.
     return db.jobs.get(jobId)!;
   }
   return db.jobs.update(jobId, { cancelRequested: true, updatedAt: now() });
+}
+
+/** Explicit recovery only for budget rejection. Completed stages and their paid outputs are never rerun. */
+export function resumeBudgetJob(db: StudioStore, jobId: string) {
+  const job = db.jobs.require(jobId, 'Job');
+  if (job.state !== 'failed' || job.error?.code !== 'budget_exceeded') throw new Error('Only budget-rejected jobs can resume. Unknown provider outcomes must never be retried automatically.');
+  if (db.stages.find(s => s.jobId === jobId && s.status === 'outcome_unknown')) throw new Error('This job contains an uncertain paid outcome and cannot resume.');
+  return db.jobs.update(jobId, { state: 'queued', error: null, finishedAt: null, leaseOwner: null, leaseExpiresAt: null, cancelRequested: false, attemptCount: 0, updatedAt: now() });
 }

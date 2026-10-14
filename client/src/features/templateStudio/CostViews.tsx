@@ -8,8 +8,10 @@ import { Badge, Money } from './ui';
 export const fxNote = (fx: StudioFx) => `Rupees at ${fx.note}`;
 
 export function EstimateTable({ estimate }: { estimate: StudioEstimate }) {
-  const counted = estimate.lines.filter(l => !l.stage.startsWith('Structure repair'));
+  const counted = estimate.lines;
   return <div className="ts-cost">
+    {estimate.localReuse && <p className="ts-hint">Local reference reuse · no AI generation charge. Original products and raster text remain.</p>}
+    {estimate.daily && <p className="ts-hint">Studio daily budget: {estimate.daily.remaining.usd} remaining of {estimate.daily.cap.usd}; {estimate.daily.used.usd} used or reserved, including {estimate.daily.held.usd} held. {estimate.daily.fits ? 'This estimate fits.' : 'Insufficient budget — paid generation is blocked.'}</p>}
     <table className="ts-cost-table">
       <caption className="ts-sr">Estimated cost before generating</caption>
       <thead><tr><th scope="col">Stage</th><th scope="col">Model</th><th scope="col" className="ts-num">Up to</th></tr></thead>

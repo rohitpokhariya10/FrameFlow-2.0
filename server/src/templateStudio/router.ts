@@ -37,14 +37,17 @@ import { toJobDto } from './jobs/dto.js';
 import { startWorker, type StudioWorker } from './jobs/worker.js';
 import { SUBJECT_ANALYST } from './prompts.js';
 import { SUBJECT_ANALYSIS_SCHEMA } from './contracts/ai.js';
-import { CALL_LIMITS, describeMoney, estimatePoster, estimateTemplateCreation, type WorkflowEstimate } from './costs/profiles.js';
-import { CostUnboundedError, estimateTextCall } from './costs/estimate.js';
+import { describeMoney, estimatePoster, estimateReferencePoster, estimateTemplateCreation, type WorkflowEstimate } from './costs/profiles.js';
+import { CostUnboundedError } from './costs/estimate.js';
 import { FAL_RATES, RATE_CARD_VERSION } from './costs/rateCard.js';
 import { spentToday } from './costs/budget.js';
 import { costSummary } from './costs/summary.js';
 import { editorOverlay, historyItems, posterDetail, posterJobIds } from './posters/dto.js';
 import { renderPosterImage, renderPosterLogo } from './posters/service.js';
 import { decompositionScene, HandoffError, linkDecomposition } from './handoff.js';
+import { resumeBudgetJob } from './jobs/queue.js';
+import { resolveReferencePolicy } from './referencePolicy.js';
+import { budgetStatus, BudgetExceededError } from './costs/budget.js';
 import { setupStatus } from './setup.js';
 
 class StudioHttpError extends Error {
@@ -161,6 +164,9 @@ export function createTemplateStudioRouter(options: TemplateStudioOptions = {}):
     } catch (e) { next(e instanceof CostUnboundedError ? new StudioHttpError(422, 'cost_unbounded', e.message) : e); }
   });
   const estimateBody = z.object({
+    fidelityMode: z.enum(['match', 'adapt', 'explore']).default('match'), direction: z.string().max(1000).nullable().optional(), occasion: z.string().max(80).nullable().optional(),
+    copy: createCampaignSchema.shape.copy.optional(), productActions: createCampaignSchema.shape.productActions,
+    backgroundOnly: createCampaignSchema.shape.backgroundOnly, referenceText: createCampaignSchema.shape.referenceText,
     templateId: z.string().nullable().optional(), formatId: z.string(), quality: z.enum(STUDIO_IMAGE_QUALITIES).optional(),
     products: z.array(z.object({ assetId: z.string(), name: z.string().max(120).default(''), subjectType: z.string().max(120).nullable().optional(), isSku: z.boolean().optional() })).max(STUDIO_MAX_PRODUCTS).default([]),
   });
@@ -177,7 +183,11 @@ export function createTemplateStudioRouter(options: TemplateStudioOptions = {}):
         const key = createHash('sha256').update(JSON.stringify({ sha: asset.sha256, name: p.name.trim(), type: p.subjectType?.trim() || null, sku: p.isSku ?? false, model: env.OPENAI_ANALYSIS_MODEL, prompt: SUBJECT_ANALYST.version, schema: SUBJECT_ANALYSIS_SCHEMA })).digest('hex');
         return subject.analysisCacheKey === key;
       }).length;
-      const w = estimatePoster(env, { subjects: body.products.length, size: format.providerSize, quality, uncachedSubjects: body.products.length - cached });
+      let policy;
+      let blockedReason: string | null = null;
+      if (body.templateId) try { policy = resolveReferencePolicy(db, { ...body, templateId: body.templateId, subjects: body.products }); }
+      catch (err) { blockedReason = (err as Error).message; }
+      const w = estimateReferencePoster(env, policy, { subjects: body.products.length, size: format.providerSize, quality, uncachedSubjects: body.products.length - cached });
       const view = templateView(db, body.templateId ?? '');
       const lines: StudioEstimateLine[] = [{
         stage: 'Reference / template analysis', model: view?.profile?.analysisModel ?? env.OPENAI_ANALYSIS_MODEL, cost: money(0), cached: true,
@@ -192,12 +202,12 @@ export function createTemplateStudioRouter(options: TemplateStudioOptions = {}):
       for (const c of w.calls.filter(c => !c.stage.startsWith('Subject analysis'))) {
         lines.push({ stage: label[c.stage] ?? (c.stage.startsWith('Scene image') ? `Image generation (${quality}, ${format.providerSize})` : c.stage), model: c.estimate.model, cost: money(c.estimate.microUsd), cached: false, assumptions: c.estimate.assumptions });
       }
-      // One bounded structure repair, only when the planner's first answer fails validation.
-      const repair = estimateTextCall({ model: env.OPENAI_PLANNER_MODEL, promptChars: CALL_LIMITS.structureRepair.promptChars, images: [], imageDetail: 'low', maxOutputTokens: CALL_LIMITS.structureRepair.maxOutputTokens });
-      lines.push({ stage: 'Structure repair (only if needed)', model: repair.model, cost: money(repair.microUsd), cached: false, note: 'Not counted in the total unless it happens.', assumptions: repair.assumptions });
+      const daily = budgetStatus(db, env);
       const estimate: StudioEstimate = {
-        label: w.label, lines, total: money(w.totalMicroUsd), cap: money(w.capMicroUsd), withinCap: w.withinCap, quality, providerSize: format.providerSize, fx: env.fx, rateCardVersion: RATE_CARD_VERSION,
-        note: 'Upper-bound estimate from published prices (not a guaranteed price). The recorded cost after generation comes from the usage OpenAI reports.',
+        label: w.label, lines, total: money(w.totalMicroUsd), cap: money(w.capMicroUsd), withinCap: w.withinCap, localReuse: policy?.localReuse ?? false, blockedReason,
+        daily: { cap: money(daily.cap), used: money(daily.used), held: money(daily.held), remaining: money(daily.remaining), fits: w.totalMicroUsd <= daily.remaining, resets: daily.resets },
+        quality, providerSize: format.providerSize, fx: env.fx, rateCardVersion: RATE_CARD_VERSION,
+        note: 'Conservative planning estimate including possible repairs and review retry; each call is also capped before sending. Not a provider invoice. Reference masks, when listed, count toward the Studio cap. Later fal/Seedream decomposition is billed separately and is outside this budget.',
       };
       res.json(estimate);
     } catch (e) { next(e instanceof CostUnboundedError ? new StudioHttpError(422, 'cost_unbounded', e.message) : e); }
@@ -322,6 +332,11 @@ export function createTemplateStudioRouter(options: TemplateStudioOptions = {}):
   router.get('/jobs/:id', (req, res, next) => {
     try { const job = db.jobs.get(id(req)) ?? (() => { throw notFound('Job'); })(); res.setHeader('Cache-Control', 'no-store'); res.json({ job: toJobDto(db, env, job) }); } catch (e) { next(e); }
   });
+  router.post('/jobs/:id/resume-budget', (req, res, next) => {
+    try { const jobId = id(req); let job; try { job = resumeBudgetJob(db, jobId); } catch (err) { throw new StudioHttpError(422, 'cannot_resume', (err as Error).message); }
+      res.status(202).json(queued({ jobId: job.id }));
+    } catch (e) { next(e); }
+  });
   router.post('/jobs/:id/cancel', (req, res, next) => {
     try { const job = requestCancel(db, id(req)); if (!job) throw notFound('Job'); res.json({ job: toJobDto(db, env, job) }); } catch (e) { next(e); }
   });
@@ -400,6 +415,7 @@ export function createTemplateStudioRouter(options: TemplateStudioOptions = {}):
     let e: StudioHttpError;
     if (error instanceof StudioHttpError) e = error;
     else if (error instanceof TemplateError) e = new StudioHttpError(error.code === 'not_found' ? 404 : 422, error.code, error.message);
+    else if (error instanceof BudgetExceededError) e = new StudioHttpError(422, error.code, error.message);
     else if (error instanceof CampaignError) e = new StudioHttpError(error.code === 'not_found' ? 404 : 422, error.code, error.message);
     else if (error instanceof BrandKitError) e = new StudioHttpError(error.code === 'not_found' ? 404 : 422, error.code, error.message, error.issues ? { issues: error.issues } : {});
     else if (error instanceof HandoffError) e = new StudioHttpError(error.code === 'not_found' ? 404 : error.code === 'mismatch' ? 409 : 400, error.code, error.message);

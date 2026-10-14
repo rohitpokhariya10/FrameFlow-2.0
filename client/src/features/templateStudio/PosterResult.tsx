@@ -81,6 +81,7 @@ export function PosterResult({ posterId, onBack, backLabel = 'Back', onDecompose
       <div className="ws-row"><a className="ws-btn" href={poster.urls.download.png}><Download size={15} aria-hidden="true" /> PNG</a><a className="ws-btn" href={poster.urls.download.jpeg}>JPEG</a></div>
     </div>
     {error && <Alert>{error}</Alert>}
+    {poster.provenance === 'reference_reuse' && <Alert tone="info">Local reference reuse · no AI image generated. Original products, raster text and logos are retained. No generation charge.</Alert>}
     {hard.length > 0 && <Alert tone="warn"><strong>The review found problems to check before using this image:</strong><ul className="ts-problems">{hard.map((h, i) => <li key={i}>{h.description}</li>)}</ul>No new image was generated automatically; regenerating is your decision.</Alert>}
 
     <div className="ts-result-grid">
@@ -96,7 +97,7 @@ export function PosterResult({ posterId, onBack, backLabel = 'Back', onDecompose
         <StepCard title="Reference vs result" hint={poster.fidelityMode === 'match' ? 'Match Reference: the new image should be the same design with new products.' : `${mode.label}: ${mode.summary}`}>
           <div className="ts-compare">
             <figure><img src={poster.template.references[0]?.thumb} alt="Template reference" /><figcaption>Template reference</figcaption></figure>
-            <figure><img src={poster.urls.poster} alt="Generated result" /><figcaption>Generated</figcaption></figure>
+            <figure><img src={poster.urls.poster} alt="Generated result" /><figcaption>{poster.provenance === 'reference_reuse' ? 'Reused reference' : 'Generated'}</figcaption></figure>
           </div>
           {poster.review?.referenceMatch && <p className="ts-match-score"><ScanSearch size={15} aria-hidden="true" /> Reference match {poster.review.referenceMatch.score}/5</p>}
         </StepCard>
@@ -104,7 +105,7 @@ export function PosterResult({ posterId, onBack, backLabel = 'Back', onDecompose
     </div>
 
     <div className="ts-two">
-      <StepCard title="Review" hint={poster.review ? `AI review (heuristic aid, not a guarantee) · ${poster.review.model} · ${fmtDate(poster.review.createdAt)}` : 'Not reviewed yet.'}>
+      <StepCard title="Review" hint={poster.review ? `AI review (heuristic aid, not a guarantee) · ${poster.review.model} · ${fmtDate(poster.review.createdAt)}` : poster.provenance === 'reference_reuse' ? 'Local asset reuse verified; no paid visual review.' : 'Not reviewed yet.'}>
         {poster.review?.summary && <p className="ts-summary">{poster.review.summary}</p>}
         {poster.review?.reviewError && <Alert tone="warn">The automatic review did not run: {poster.review.reviewError}</Alert>}
         <ReviewChecklist checks={poster.checks} />
@@ -117,8 +118,8 @@ export function PosterResult({ posterId, onBack, backLabel = 'Back', onDecompose
 
     <StepCard title="Not right? Your decision, never automatic">
       {recheck && !recheck.terminal ? <JobSteps job={recheck} /> : <div className="ws-row">
-        <button type="button" className="ws-btn" disabled={busy} onClick={() => setConfirm(confirm === 'review' ? null : 'review')}><ScanSearch size={15} aria-hidden="true" /> Re-check (review only)</button>
-        <button type="button" className="ws-btn" disabled={busy} onClick={() => setConfirm(confirm === 'regenerate' ? null : 'regenerate')}><RefreshCw size={15} aria-hidden="true" /> Regenerate</button>
+        <button type="button" className="ws-btn" disabled={busy || poster.provenance === 'reference_reuse'} onClick={() => setConfirm(confirm === 'review' ? null : 'review')}><ScanSearch size={15} aria-hidden="true" /> Re-check (review only)</button>
+        <button type="button" className="ws-btn" disabled={busy || poster.provenance === 'reference_reuse'} onClick={() => setConfirm(confirm === 'regenerate' ? null : 'regenerate')}><RefreshCw size={15} aria-hidden="true" /> Regenerate</button>
       </div>}
       {confirm === 'review' && <div className="ts-confirm"><p>Runs the AI review again on this same image (one text call{reviewCost?.estimated ? `, up to about ${reviewCost.estimated.inr}` : ''}). No new image.</p>
         <div className="ws-row"><button type="button" className="ws-btn ws-btn-primary" disabled={busy} onClick={() => void act(async () => { const r = await studioApi.post<{ jobId: string }>(`/posters/${poster.id}/review`, { idempotencyKey: once('review') }); delete keys.current.review; setRecheckJob(r.jobId); setConfirm(null); })}>Re-check (paid)</button><button type="button" className="ws-btn ws-btn-quiet" onClick={() => setConfirm(null)}>Cancel</button></div></div>}
@@ -142,14 +143,18 @@ export function PosterResult({ posterId, onBack, backLabel = 'Back', onDecompose
 
 /** A generation in progress: its steps, then the result. */
 export function GenerationRun({ jobId, onDone, onCancelled }: { jobId: string; onDone: (posterId: string) => void; onCancelled?: () => void }) {
+  const [refresh, setRefresh] = useState(0), [resumeError, setResumeError] = useState('');
   const [cancelling, setCancelling] = useState(false);
-  const { job, error } = useJob(jobId, (j: StudioJob) => { const id = (j.result as { posterId?: string } | null)?.posterId; if (id) onDone(id); });
+  const { job, error } = useJob(jobId, (j: StudioJob) => { const id = (j.result as { posterId?: string } | null)?.posterId; if (id) onDone(id); }, refresh);
   if (error) return <div className="ts-page"><Alert>{error}</Alert></div>;
   if (!job) return <div className="ts-page"><p className="ts-muted" role="status">Starting…</p></div>;
   return <div className="ts-page">
     <StepCard title={job.terminal ? (job.state === 'failed' ? 'Generation failed' : job.state === 'cancelled' ? 'Generation cancelled' : 'Generation finished') : 'Generating your image'} hint="Usually one to two minutes. You can leave this page; the result appears in Generation History.">
       <JobSteps job={job} />
       {job.error && <Alert>{job.error.message}{job.error.code === 'outcome_unknown' ? ' Nothing was repeated automatically.' : ''}</Alert>}
+      {Boolean(job.cost.reserved?.microUsd) && <Alert tone="warn">{job.cost.reserved!.usd} remains reserved for calls with an unknown outcome; it may have been billed and has not been treated as free.</Alert>}
+      {resumeError && <Alert>{resumeError}</Alert>}
+      {job.error?.code === 'budget_exceeded' && <button className="ws-btn" disabled={cancelling} onClick={async () => { setCancelling(true); try { await studioApi.post(`/jobs/${job.id}/resume-budget`); setRefresh(r => r + 1); } catch (err) { setResumeError((err as Error).message); } finally { setCancelling(false); } }}>Resume remaining steps (paid; completed work is reused)</button>}
       {job.cost.calls > 0 && <p className="ts-muted">Recorded so far: {job.cost.total.inr} ({job.cost.calls} paid call{job.cost.calls === 1 ? '' : 's'}).</p>}
       {!job.terminal && <button type="button" className="ws-btn" disabled={cancelling || job.cancelRequested} onClick={async () => { setCancelling(true); try { await studioApi.post(`/jobs/${job.id}/cancel`); } finally { setCancelling(false); } }}>{job.cancelRequested ? 'Stopping after this step…' : 'Cancel'}</button>}
       {job.terminal && job.state !== 'complete' && job.state !== 'needs_review' && onCancelled && <button type="button" className="ws-btn" onClick={onCancelled}>Back to the form</button>}

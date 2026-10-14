@@ -1,3 +1,7 @@
+import { prepareReference, referenceEditInputs, composeReference, validateReferenceEdit, type PreparedReference } from '../../referenceProducts.js';
+import { reuseReference } from './reuseReference.js';
+import { preflightBudget } from '../../costs/budget.js';
+import { estimateReferencePoster } from '../../costs/profiles.js';
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { imageCall, structuredCall, type CallContext } from "../../ai/calls.js";
@@ -29,16 +33,17 @@ import { listFonts } from "../../fonts/library.js";
 import { renderDoc, snapshotRules } from "../../posters/service.js";
 import { SUBJECT_ANALYST, artDirector, visualReviewer } from "../../prompts.js";
 import { readStorageFile } from "../../storage.js";
-import { newId, now, type AssetRecord as Asset, type PosterRecord } from "../../store.js";
+import { newId, now, type AssetRecord as Asset, type PosterRecord, type ReferencePolicy } from "../../store.js";
 import { JobStageError, type JobKindDef, type StageContext } from "../runner.js";
 
 export interface GeneratePosterInput {
+  referencePolicy?: ReferencePolicy;
   campaignId: string;
   templateId: string;
   profileVersionId: string;
   clusterId: string | null;
   brandKitId: string | null;
-  subjects: { subjectId: string; assetId: string; name: string; subjectType: string | null; isSku: boolean }[];
+  subjects: { subjectId: string; assetId: string; name: string; subjectType: string | null; isSku: boolean; referenceProductId?: string }[];
   copy: CampaignCopy;
   partnerLogoIds: string[];
   formatId: string;
@@ -54,6 +59,8 @@ export interface GeneratePosterInput {
 }
 
 function deps(ctx: StageContext, input = ctx.job.inputSnapshot as unknown as GeneratePosterInput) {
+  const prepared = ctx.outputs.prepare_reference as PreparedReference | null | undefined;
+  if (prepared) input = { ...input, subjects: prepared.subjects };
   const { env, provider } = ctx.deps;
   if (!env || !provider) throw new JobStageError("not_configured", "The worker is missing its provider configuration.");
   const call: CallContext = { db: ctx.db, env, provider, job: ctx.job };
@@ -74,9 +81,13 @@ function loadContext(ctx: StageContext, input: GeneratePosterInput) {
   const rules = snapshotRules(campaign.brandSnapshot);
   const format = getFormat(input.formatId);
   if (!format) throw new JobStageError("invalid_format", `Unknown output format "${input.formatId}".`);
-  const aspects = styleRefs.map((r) => r.asset.width / r.asset.height).filter((a) => a > 0);
+  // Primary composition is stable even when a style cluster excludes ref1.
+  const primary = refs.find(a => a.sha256 === hashes.ref1);
+  if (primary) { const i = styleRefs.findIndex(r => r.asset.id === primary.id); if (i >= 0) styleRefs.splice(i, 1); styleRefs.unshift({ id: 'ref1', asset: primary }); }
+  const aspects = styleRefs.slice(0, 1).map((r) => r.asset.width / r.asset.height).filter((a) => a > 0);
   const refAspect = aspects.length ? aspects.reduce((a, b) => a + b, 0) / aspects.length : 1;
   const framing = framingRules(profile, format, refAspect);
+  if (mode(input) !== 'match') Object.assign(framing, { source: 'default', staging: 'Staging follows the requested environment.', heroPlacement: 'Keep product identity and readable hierarchy.', backdrop: null, maxGroupWidth: 0.85, maxGroupHeight: 0.8, minTop: 0.05, minSide: 0.04, maxBottom: 0.95 });
   return { profile, cluster, styleRefs, rules, format, campaign, framing };
 }
 
@@ -101,6 +112,8 @@ export function planProblems(plan: ConceptPlan, subjectIds: string[], fields: st
     const n = plan.subjects.filter((s) => s.subjectId === id).length;
     if (n !== 1) problems.push(`Subject ${id} must appear exactly once in subjects (found ${n}).`);
   }
+  if (plan.subjects.some(s => !subjectIds.includes(s.subjectId))) problems.push('Unrequested subject in plan.');
+  if (plan.texts.some(t => !fields.includes(t.field))) problems.push('Unrequested copy field in plan.');
   for (const f of fields) {
     const n = plan.texts.filter((t) => t.field === f).length;
     if (n !== 1) problems.push(`Copy field "${f}" must have exactly one text region (found ${n}).`);
@@ -177,7 +190,11 @@ async function reviewPoster(ctx: StageContext, input: GeneratePosterInput, poste
           theme,
           approvedScene: { userDirection: input.direction, environment: planned.environment, background: planned.background, palette: planned.palette, mood: planned.mood },
           subjects: input.subjects.map((s) => ({ name: s.name, type: s.subjectType })),
-          expectedSubjectCount: input.subjects.length,
+          expectedSubjectCount: poster.expectedProductCount ?? input.subjects.length,
+          expectedProductActions: input.referencePolicy?.actions,
+          referenceTextPolicy: input.referencePolicy?.text,
+          deterministicProductCheck: poster.exactProducts,
+          reviewInstructions: 'Count and identify every expected product individually. Missing products are critical even with perfect style similarity. Expected removals/replacements are deliberate. Pixel checks establish only source pixels inside masks, not mask completeness or visual identity.', 
           addedDeliberately: {
             textLayers: "All campaign text in Image A is added on purpose as layers; check its readability, not its presence.",
             brandLogo: input.brandKitId ? "The brand's official logo (and any partner logos) in Image A is placed on purpose from the brand kit; do not flag it as copied." : null,
@@ -194,7 +211,7 @@ async function reviewPoster(ctx: StageContext, input: GeneratePosterInput, poste
       content.push({
         type: "text",
         text: fidelity === "match"
-          ? `Template example ${ref.id} (the design this poster must match; its products, text and logos must not appear):`
+          ? `Template example ${ref.id} (primary composition to match; KEEP products must remain, only explicit removals/replacements change; follow reference text policy):`
           : `Template example ${ref.id} (one example of the design language; its setting is not a requirement):`,
       });
       content.push({ type: "image", data: img.data, mime: img.mime, detail: "low", width: img.width, height: img.height });
@@ -233,12 +250,19 @@ async function reviewPoster(ctx: StageContext, input: GeneratePosterInput, poste
   }
 
   if (review) {
-    for (const t of review.unwantedSceneText) hardFailures.push({ code: "scene_text", description: `The generated image contains text: ${t}` });
+    const integrity = review.productIntegrity;
+    const expected = poster.expectedProductCount ?? input.subjects.length;
+    if (integrity && (integrity.observedCount !== null && integrity.observedCount !== expected || integrity.missing.length || integrity.unexpected.length)) hardFailures.push({ code: 'subject_count', description: `Expected ${expected} products; reviewer observed ${integrity.observedCount ?? 'an uncertain count'}. Missing: ${integrity.missing.join(', ') || 'none named'}. Unexpected: ${integrity.unexpected.join(', ') || 'none named'}.` });
+    if (integrity?.identityProblems.length) hardFailures.push({ code: 'product_identity', description: integrity.identityProblems.join('; ') });
+    if (integrity?.uncertainties.length) hardFailures.push({ code: 'product_uncertain', description: integrity.uncertainties.join('; ') });
+    for (const t of (input.referencePolicy?.text === "keep" ? [] : review.unwantedSceneText)) hardFailures.push({ code: "scene_text", description: `The generated image contains text: ${t}` });
     for (const c of review.copiedReferenceContent) hardFailures.push({ code: "copied_reference", description: `Copied from the reference: ${c}` });
-    if (review.scores.subjectCount <= 2 && input.subjects.length > 0) hardFailures.push({ code: "subject_count", description: "The reviewer thinks a product is missing or duplicated." });
+    if (review.scores.subjectCount <= 2 && (poster.expectedProductCount ?? input.subjects.length) > 0) hardFailures.push({ code: "subject_count", description: "The reviewer thinks a product is missing or duplicated." });
+    if (review.scores.subjectIdentity <= 2 && (poster.expectedProductCount ?? input.subjects.length) > 0) hardFailures.push({ code: 'product_identity', description: 'The reviewer reports a critical product identity mismatch.' });
     hardFailures.push(...referenceMatchFailures(review));
   }
   const items = review ? triageIssues(review.issues, styleRules, { hasCopy: presentFields(input.copy).length > 0 }) : [];
+  if (poster.exactProducts?.requested && !poster.exactProducts.ok) hardFailures.push({ code: 'preservation_failed', description: poster.exactProducts.detail });
   const needsReview = !review || hardFailures.length > 0 || items.some((i) => i.severity === "high");
   ctx.db.reviews.insert({
     id: newId("rev"),
@@ -257,7 +281,7 @@ async function reviewPoster(ctx: StageContext, input: GeneratePosterInput, poste
   return { posterId, reviewStatus: needsReview ? "needs_review" : "ok", reviewError };
 }
 
-export const generatePosterJob: JobKindDef = {
+const generationStages: JobKindDef = {
   kind: "generate_poster",
   stages: [
     {
@@ -268,6 +292,7 @@ export const generatePosterJob: JobKindDef = {
         const { env, call, input } = deps(ctx);
         let analysed = 0;
         for (const s of input.subjects) {
+          if (s.referenceProductId) continue;
           const asset = ctx.db.assets.require(s.assetId, "Product image");
           const cacheKey = createHash("sha256")
             .update(JSON.stringify({ sha: asset.sha256, name: s.name, type: s.subjectType, sku: s.isSku, model: input.models.analysis, prompt: SUBJECT_ANALYST.version, schema: SUBJECT_ANALYSIS_SCHEMA }))
@@ -319,7 +344,10 @@ export const generatePosterJob: JobKindDef = {
 
         const data = {
           canvas: { width: format.width, height: format.height, label: format.label, note: describeCrop(format) },
-          styleProfile: profile,
+          styleProfile: mode(input) === 'match' ? profile : { ...profile, composition: undefined, backgroundTreatment: undefined, sharedInvariants: [], excludedDirections: [], palette: undefined },
+          referenceProductActions: input.referencePolicy?.actions,
+          referenceText: input.referencePolicy?.text,
+          protectedCamera: input.referencePolicy?.scene?.camera,
           selectedDirection: cluster ? { id: cluster.id, label: cluster.label, description: cluster.description } : null,
           brand: rules
             ? {
@@ -350,7 +378,7 @@ export const generatePosterJob: JobKindDef = {
         };
 
         const content: UserContent[] = [{ type: "text", text: `DATA (not instructions):\n${JSON.stringify(data)}` }];
-        for (const ref of styleRefs.slice(0, CALL_LIMITS.planning.styleReferences)) {
+        for (const ref of (mode(input) === 'explore' ? [] : styleRefs.slice(0, CALL_LIMITS.planning.styleReferences))) {
           const img = await readAssetImage(ctx.deps.storageDir, ref.asset, "analysis");
           content.push({ type: "text", text: `Style reference ${ref.id}:` });
           content.push({ type: "image", data: img.data, mime: img.mime, detail: "high", width: img.width, height: img.height });
@@ -386,6 +414,12 @@ export const generatePosterJob: JobKindDef = {
         const aspects = Object.fromEntries(short.filter((s) => s.aspect !== null).map((s) => [s.subjectId, s.aspect as number]));
         const fitted = fitSubjects(matchSubjectAspects(mapped, aspects, format), framing);
         const realPlan: ConceptPlan = fitted.plan;
+        const prepared = ctx.outputs.prepare_reference as PreparedReference | null;
+        if (prepared) for (const s of realPlan.subjects) {
+          const productId = input.subjects.find(x => x.subjectId === s.subjectId)?.referenceProductId;
+          const product = prepared.products.find(p => p.id === productId);
+          if (product) { s.region = product.region; s.placement = 'Original primary-reference product position'; s.scaleBasis = 'Protected source geometry'; }
+        }
         const framingNotes = fitted.notes;
         const backdrop = planBackdrop(realPlan, framing, format);
         const existing = ctx.db.conceptPlans.find((p) => p.jobId === ctx.job.id);
@@ -426,9 +460,12 @@ export const generatePosterJob: JobKindDef = {
         const plannedBackdrop = (ctx.outputs.plan as { backdrop?: PlannedBackdrop | null }).backdrop ?? null;
         const backdrop = plannedBackdrop ? { ...plannedBackdrop, region: canvasToSource(format, plannedBackdrop.region) } : null;
 
+        const prepared = ctx.outputs.prepare_reference as PreparedReference | null;
+        const editInputs = prepared ? await referenceEditInputs(ctx, input, prepared, sceneCrop(format).source) : null;
         const manifest: ManifestEntry[] = [];
         const images: { data: Buffer; mime: string; name: string }[] = [];
         const textFields = presentFields(input.copy);
+        if (editInputs) { images.push({ data: editInputs.image, mime: 'image/png', name: 'primary-protected.png' }); manifest.push({ index: 1, assetId: prepared!.sourceAssetId, role: 'primary_reference', label: 'Protected primary products', subjectId: null }); }
         let layoutGuideAssetId: string;
         {
           // Layout guide first, at the generation size: the image model treats the first image as the canvas it builds on.
@@ -448,7 +485,7 @@ export const generatePosterJob: JobKindDef = {
           manifest.push({ index: images.length, assetId: asset.id, role: "layout_guide", label: "Layout guide", subjectId: null });
         }
 
-        for (const ref of styleRefs.slice(0, CALL_LIMITS.imagePrompt.styleReferences)) {
+        for (const ref of (mode(input) === 'explore' ? [] : styleRefs.slice(0, CALL_LIMITS.imagePrompt.styleReferences))) {
           const img = await readAssetImage(ctx.deps.storageDir, ref.asset, "analysis");
           images.push({ data: img.data, mime: img.mime, name: `style-${ref.id}.${img.mime === "image/png" ? "png" : "jpg"}` });
           manifest.push({ index: images.length, assetId: ref.asset.id, role: "style_reference", label: ref.id, subjectId: null });
@@ -469,6 +506,8 @@ export const generatePosterJob: JobKindDef = {
           brand: rules,
           textFields,
           fidelityMode: mode(input),
+          direction: input.direction,
+          referencePolicy: input.referencePolicy,
           framing,
           backdrop,
         });
@@ -495,7 +534,7 @@ export const generatePosterJob: JobKindDef = {
         });
         let res;
         try {
-          res = await imageCall(call, "generate_scene", { model: input.models.image, prompt, images, size: format.providerSize, quality: input.quality });
+          res = await imageCall(call, "generate_scene", { model: input.models.image, prompt, images, ...(editInputs ? { mask: editInputs.mask } : {}), size: format.providerSize, quality: input.quality });
         } catch (err) {
           const e = err as JobStageError;
           ctx.db.attempts.update(attempt.id, { outcome: e.opts?.outcomeUnknown ? "outcome_unknown" : "failed", error: { code: e.code, message: e.message } });
@@ -510,7 +549,7 @@ export const generatePosterJob: JobKindDef = {
           usage: res.usage ?? null,
           costStatus: res.costMicroUsd === null ? "unknown" : "usage_derived",
         });
-        return { sceneAssetId: asset.id, attemptId: attempt.id };
+        return { sceneAssetId: asset.id, attemptId: attempt.id, placement: editInputs?.placement };
       },
     },
     {
@@ -530,7 +569,19 @@ export const generatePosterJob: JobKindDef = {
         let docCrop = { x: Math.round(crop.x * sx), y: Math.round(crop.y * sy), width: Math.round(crop.width * sx), height: Math.round(crop.height * sy) };
         let scene = generated;
         let exactProducts: PosterRecord["exactProducts"] = null;
-        if (input.preserveProductPixels && input.subjects.length) {
+        let productLayers: PosterRecord['productLayers'];
+        let decompositionAssetId: string | undefined;
+        const prepared = ctx.outputs.prepare_reference as PreparedReference | null;
+        if (prepared) {
+          const generatedStage = ctx.outputs.generate_scene as { placement: { x: number; y: number; width: number; height: number } };
+          const exact = await composeReference(ctx, input, prepared, generatedData, generatedStage.placement, format.providerSize);
+          scene = (await ingestAsset({ buffer: exact.composite, role: 'generated_scene', filename: `preserved-${ctx.job.id}.png` }, { db: ctx.db, storageDir: ctx.deps.storageDir })).asset;
+          docCrop = { x: 0, y: 0, width: scene.width, height: scene.height };
+          exactProducts = { requested: true, applied: true, ok: true, detail: exact.detail };
+          productLayers = exact.layers;
+          decompositionAssetId = (await ingestAsset({ buffer: exact.plate, role: 'generated_scene', filename: `protected-background-${ctx.job.id}.png` }, { db: ctx.db, storageDir: ctx.deps.storageDir })).asset.id;
+        }
+        if (!prepared && input.preserveProductPixels && input.subjects.length) {
           // FrameFlow's compositor places each product's own pixels where it was planned; on any failure the model's scene stays and says so.
           try {
             const products = await Promise.all(
@@ -546,18 +597,20 @@ export const generatePosterJob: JobKindDef = {
             docCrop = { x: 0, y: 0, width: asset.width, height: asset.height };
             exactProducts = { requested: true, applied: true, ok: exact.ok, detail: exact.detail };
           } catch (err) {
-            exactProducts = { requested: true, applied: false, ok: null, detail: `Exact product pixels could not be applied (${err instanceof Error ? err.message : String(err)}); the products shown are the image model's redraw.` };
+            throw new JobStageError('preservation_failed', `Exact product pixels could not be applied: ${(err as Error).message}. No redraw was accepted.`);
           }
         }
         const sceneData = scene === generated ? generatedData : await readStorageFile(ctx.deps.storageDir, scene.normalisedPath);
-        const tmpDoc = { crop: docCrop, canvas: { width: format.width, height: format.height } };
+        // Keep the full primary canvas: source products are never cropped or stretched to fit an export preset.
+        const composeFormat = prepared ? { ...format, width: scene.width, height: scene.height } : format;
+        const tmpDoc = { crop: docCrop, canvas: { width: composeFormat.width, height: composeFormat.height } };
         const { raw } = await canvasScene(tmpDoc, sceneData);
         const { families } = await listFonts(ctx.db, input.brandKitId);
 
         const doc: OverlayDoc = buildOverlay({
           plan,
           copy: input.copy,
-          format,
+          format: composeFormat,
           crop: docCrop,
           sceneAssetId: scene.id,
           sceneRaw: raw,
@@ -566,6 +619,7 @@ export const generatePosterJob: JobKindDef = {
           brandKitId: input.brandKitId,
           partnerLogoIds: input.partnerLogoIds,
         });
+        if (prepared) doc.notes.push(...prepared.warnings, 'Reference product composition retains the original canvas proportions; export dimensions follow this canvas.');
         overlayDocSchema.parse(doc);
         const { report } = await renderDoc(ctx.db, ctx.deps.storageDir, doc, rules, { format: "png", width: 64 });
         const existing = ctx.db.posters.find((p) => p.jobId === ctx.job.id);
@@ -575,7 +629,7 @@ export const generatePosterJob: JobKindDef = {
           jobId: ctx.job.id,
           sceneAssetId: scene.id,
           rawSceneAssetId: scene === generated ? null : generated.id,
-          exactProducts,
+          exactProducts, productLayers, decompositionAssetId, provenance: 'ai_generated', expectedProductCount: input.subjects.length,
           overlay: doc,
           layoutReport: report,
           reviewStatus: "pending",
@@ -593,7 +647,7 @@ export const generatePosterJob: JobKindDef = {
       async run(ctx) {
         const { posterId } = ctx.outputs.compose as { posterId: string };
         const plan = (ctx.outputs.plan as { plan: ConceptPlan }).plan;
-        return reviewPoster(ctx, ctx.job.inputSnapshot as unknown as GeneratePosterInput, posterId, plan.scene, plan.theme ?? null);
+        return reviewPoster(ctx, deps(ctx).input, posterId, plan.scene, plan.theme ?? null);
       },
     },
   ],
@@ -601,6 +655,32 @@ export const generatePosterJob: JobKindDef = {
     const review = outputs.review as { posterId: string; reviewStatus: string };
     return { state: review.reviewStatus === "ok" ? "complete" : "needs_review", result: { posterId: review.posterId } };
   },
+};
+
+/** New jobs use an explicit reference policy. Earlier completed jobs remain readable. */
+export const generatePosterJob: JobKindDef = {
+  ...generationStages,
+  stages: [
+    { name: 'preflight', state: 'planning', paid: false, async run(ctx) {
+      const { input, env } = deps(ctx);
+      if (input.referencePolicy?.localReuse) return { local: true };
+      if (!input.referencePolicy) throw new JobStageError('legacy_request', 'This older generation request lacks explicit reference-product choices. Start a new generation from the template; no paid work was repeated.');
+      validateReferenceEdit(input.referencePolicy);
+      const format = getFormat(input.formatId)!;
+      const estimate = estimateReferencePoster(env, input.referencePolicy, { subjects: input.subjects.length, quality: input.quality, size: format.providerSize });
+      try { preflightBudget(ctx.db, env, estimate.totalMicroUsd); }
+      catch (err) { throw new JobStageError('budget_exceeded', (err as Error).message); }
+      return { estimateMicroUsd: estimate.totalMicroUsd };
+    } },
+    { name: 'reuse_reference', state: 'composing', paid: false, async run(ctx) {
+      const { input } = deps(ctx); return input.referencePolicy?.localReuse ? reuseReference(ctx, input) : null;
+    } },
+    { name: 'prepare_reference', state: 'analysing', paid: true, async run(ctx) { return ctx.outputs.reuse_reference ? null : prepareReference(ctx, deps(ctx).input); } },
+    ...generationStages.stages.map(stage => ({ ...stage, async run(ctx: StageContext) {
+      if (ctx.outputs.reuse_reference) return stage.name === 'review' ? ctx.outputs.reuse_reference : { skipped: 'local reference reuse' };
+      return stage.run(ctx);
+    } })),
+  ],
 };
 
 /** Re-run only the review for an existing poster (an explicit, paid user action). No image call. */
@@ -619,7 +699,9 @@ export const reviewPosterJob: JobKindDef = {
         const plan = ctx.db.conceptPlans.find((p) => p.jobId === poster.jobId);
         if (!plan) throw new JobStageError("not_found", "The poster's art direction is missing.");
         const saved = plan.scenePlan as unknown as { scene: ConceptPlan["scene"]; theme?: ConceptPlan["theme"] };
-        return reviewPoster(ctx, original.inputSnapshot as unknown as GeneratePosterInput, posterId, saved.scene, saved.theme ?? null);
+        const savedInput = original.inputSnapshot as unknown as GeneratePosterInput;
+        const prepared = ctx.db.stages.find(s => s.jobId === original.id && s.stage === 'prepare_reference' && s.status === 'done')?.output as PreparedReference | null;
+        return reviewPoster(ctx, prepared ? { ...savedInput, subjects: prepared.subjects } : savedInput, posterId, saved.scene, saved.theme ?? null);
       },
     },
   ],

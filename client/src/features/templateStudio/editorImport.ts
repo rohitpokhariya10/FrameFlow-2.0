@@ -47,7 +47,7 @@ export function overlayTexts(overlay: StudioEditorOverlay, width: number, height
 }
 
 /** The first version of `document` with the copy and logo added; the document unchanged if the result would not validate. */
-export function withNativeOverlay(document: ProjectDocument, overlay: StudioEditorOverlay, logoAssetId: string | null, newId: () => string): { document: ProjectDocument; applied: boolean } {
+export function withNativeOverlay(document: ProjectDocument, overlay: StudioEditorOverlay, logoAssetId: string | null, newId: () => string, productAssets: Record<string, string> = {}): { document: ProjectDocument; applied: boolean } {
   const [first, ...rest] = document.variants;
   const { width, height } = first.canvas;
   const logo: DesignLayer[] = overlay.logo && logoAssetId ? [{
@@ -55,7 +55,12 @@ export function withNativeOverlay(document: ProjectDocument, overlay: StudioEdit
     x: overlay.logo.box.x * width, y: overlay.logo.box.y * height, width: Math.max(1, overlay.logo.box.width * width), height: Math.max(1, overlay.logo.box.height * height),
     rotation: 0, opacity: 1, visible: true, locked: false,
   }] : [];
-  const variant = { ...first, elements: [...first.elements, ...overlayTexts(overlay, width, height, newId)], layers: [...(first.layers ?? []), ...logo] };
+  const products: DesignLayer[] = (overlay.products ?? []).filter(p => productAssets[p.id]).map(p => ({
+    id: `studio-product-${newId()}`, type: 'image', assetId: productAssets[p.id], name: `Protected product · ${p.id}`, role: 'subject',
+    x: p.box.x * width, y: p.box.y * height, width: Math.max(1, p.box.width * width), height: Math.max(1, p.box.height * height),
+    rotation: 0, opacity: 1, visible: true, locked: false,
+  }));
+  const variant = { ...first, elements: [...first.elements, ...overlayTexts(overlay, width, height, newId)], layers: [...(first.layers ?? []), ...products, ...logo] };
   if (!isDesignVariant(variant)) return { document, applied: false };
   return { document: { ...document, variants: [variant, ...rest] }, applied: true };
 }
@@ -73,6 +78,15 @@ export async function prepareStudioImport(runId: string, assets: Assets, newId: 
   if (!response.ok) return null;
   const overlay = await response.json() as StudioEditorOverlay;
   let logoAssetId: string | null = null, used = false;
+  const productAssets: Record<string, string> = {};
+  try {
+    for (const product of overlay.products ?? []) {
+      const response = await fetch(product.url, { cache: 'no-store' });
+      if (!response.ok) throw new Error('A protected product layer could not be loaded. Import was stopped to avoid dropping products.');
+      const assetId = `studio-product-${newId()}`;
+      await assets.putAsset(assetId, await response.blob()); productAssets[product.id] = assetId;
+    }
+  } catch (err) { await Promise.all(Object.values(productAssets).map(id => assets.deleteAsset(id))); throw err; }
   if (overlay.logo) {
     const logo = await fetch(overlay.logo.url, { cache: 'no-store' });
     if (logo.ok) { logoAssetId = `studio-logo-${newId()}`; await assets.putAsset(logoAssetId, await logo.blob()); }
@@ -80,10 +94,11 @@ export async function prepareStudioImport(runId: string, assets: Assets, newId: 
   return {
     link,
     wrap: (openNew: (document: ProjectDocument) => void) => (document: ProjectDocument) => {
-      const next = withNativeOverlay(document, overlay, logoAssetId, newId);
+      const next = withNativeOverlay(document, overlay, logoAssetId, newId, productAssets);
+      if (!next.applied && Object.keys(productAssets).length) throw new Error('Protected product layers did not pass editor validation. Import was stopped.');
       openNew(next.document);
-      used = next.applied && Boolean(logoAssetId);
+      used = next.applied;
     },
-    finish: async () => { if (logoAssetId && !used) await assets.deleteAsset(logoAssetId).catch(() => undefined); },
+    finish: async () => { if (!used) await Promise.all([...Object.values(productAssets), ...(logoAssetId ? [logoAssetId] : [])].map(id => assets.deleteAsset(id).catch(() => undefined))); },
   };
 }

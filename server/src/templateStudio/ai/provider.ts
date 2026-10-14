@@ -34,6 +34,7 @@ export interface StructuredResponse {
 }
 
 export interface ImageEditRequest {
+  mask?: Buffer;
   model: string;
   prompt: string;
   images: { data: Buffer; mime: string; name: string }[];
@@ -121,6 +122,7 @@ export class OpenAIProvider implements Provider {
           {
             model: req.model,
             image: files,
+            ...(req.mask ? { mask: await toFile(req.mask, 'edit-mask.png', { type: 'image/png' }) } : {}),
             prompt: req.prompt,
             size: req.size,
             quality: req.quality,
@@ -136,7 +138,7 @@ export class OpenAIProvider implements Provider {
           code: "unknown",
           message: "The image service returned no image.",
           safeToRetry: false,
-          outcomeUnknown: false,
+          outcomeUnknown: true,
           requestId: request_id,
         });
       }

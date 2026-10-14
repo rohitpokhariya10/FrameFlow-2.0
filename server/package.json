@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --conditions=development --env-file-if-exists=.env src/index.ts",
+    "dev": "tsx watch --conditions=development --env-file-if-exists=../.env --env-file-if-exists=.env src/index.ts",
     "build": "tsc",
-    "start": "node --env-file-if-exists=.env dist/index.js",
+    "start": "node --env-file-if-exists=../.env --env-file-if-exists=.env dist/index.js",
     "typecheck": "tsc --noEmit",
     "worker": "node --env-file-if-exists=.env dist/decomposition/workerEntry.js",
     "worker:dev": "tsx watch --conditions=development --env-file-if-exists=.env src/decomposition/workerEntry.ts",

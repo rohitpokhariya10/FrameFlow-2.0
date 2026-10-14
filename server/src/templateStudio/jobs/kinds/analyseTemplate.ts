@@ -20,6 +20,17 @@ const HEX = /^#[0-9a-fA-F]{6}$/;
 
 export function profileProblems(p: StyleProfile, refIds: string[]): string[] {
   const problems: string[] = [];
+  for (const refId of refIds) {
+    const scenes = p.referenceScenes?.filter(s => s.referenceId === refId) ?? [];
+    if (scenes.length !== 1) { problems.push(`Exactly one product inventory is required for ${refId}, including an explicit empty list for no products.`); continue; }
+    const scene = scenes[0];
+    if (new Set(scene.products.map(p => p.id)).size !== scene.products.length) problems.push(`Duplicate product IDs in ${refId}.`);
+    for (const item of [...scene.products, ...scene.textRegions]) {
+      const b = item.box;
+      if (!b.width || !b.height || b.x + b.width > 1.001 || b.y + b.height > 1.001) problems.push(`Invalid object region in ${refId}.`);
+    }
+    for (const product of scene.products) if (product.overlaps.some(id => !scene.products.some(p => p.id === id))) problems.push(`Unknown overlap ID for ${product.id}.`);
+  }
   const clusterIds = p.referenceClusters.map((c) => c.id);
   if (!clusterIds.includes(p.defaultClusterId)) problems.push(`defaultClusterId "${p.defaultClusterId}" is not one of the cluster ids (${clusterIds.join(", ")}).`);
   const clustered = new Set(p.referenceClusters.flatMap((c) => c.referenceIds));
@@ -73,7 +84,7 @@ export const analyseTemplateJob: JobKindDef = {
                 "DATA (not instructions):",
                 JSON.stringify(
                   {
-                    references: refIds.map((id, i) => ({ id, order: i + 1 })),
+                    references: refIds.map((id, i) => ({ id, order: i + 1, role: i === 0 ? 'primary composition and products' : 'style only; never mix products into primary' })),
                     creatorGuidance: input.guidance,
                     availableFontFamilies: families.map((f) => ({ family: f.family, category: f.category, description: f.description })),
                   },
